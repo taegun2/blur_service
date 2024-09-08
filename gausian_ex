@@ -1,0 +1,35 @@
+import cv2
+from matplotlib import pyplot as plt
+
+def apply_dynamic_gaussian_blur(image, blur_intensity):
+    # blur_intensity (0 ~ 100) -> 커널 크기 변환
+    kernel_size = 2 * (blur_intensity // 2) + 1  # 홀수로 변환
+    sigma = blur_intensity / 2  # sigma 값을 블러 강도에 맞게 조절
+    
+    # 가우시안 블러 적용
+    blurred_image = cv2.GaussianBlur(image, (kernel_size, kernel_size), sigma)
+    
+    return blurred_image
+
+# 원본 이미지 로드
+image_path = '/mnt/data/image.png'
+image = cv2.imread(image_path)
+image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+# 사용자 입력 예시
+user_input = 50  # 0 ~ 100 값 입력 받음
+blurred_image = apply_dynamic_gaussian_blur(image_rgb, user_input)
+
+# 결과 출력
+plt.figure(figsize=(10, 5))
+plt.subplot(1, 2, 1)
+plt.imshow(image_rgb)
+plt.title("Original Image")
+plt.axis('off')
+
+plt.subplot(1, 2, 2)
+plt.imshow(blurred_image)
+plt.title(f"Blurred Image (Input: {user_input})")
+plt.axis('off')
+
+plt.show()
