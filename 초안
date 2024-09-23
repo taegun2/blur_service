@@ -1,0 +1,233 @@
+import subprocess
+import os
+from flask import Flask, request, jsonify
+from google.cloud import storage
+import cv2
+import numpy as np
+from keras.models import load_model
+from mtcnn.mtcnn import MTCNN
+import io
+import base64
+
+app = Flask(__name__)
+
+# Google Cloud Storage 설정
+client = storage.Client()
+bucket_name = 'your-gcs-bucket-name'
+bucket = client.get_bucket(bucket_name)
+
+# FaceNet 모델 로드
+facenet_model = load_model('facenet_keras.h5')
+
+# 얼굴 감지기 (MTCNN)
+detector = MTCNN()
+
+# 얼굴 임베딩을 저장할 데이터 구조
+face_tracker = {}
+
+# GCS에서 동영상 다운로드
+def download_video_from_gcs(gcs_path):
+    blob = bucket.blob(gcs_path)
+    video_data = blob.download_as_bytes()
+    return video_data
+
+# 얼굴 감지 및 임베딩 추출 함수 (한 번만 수행)
+def detect_faces_and_get_embeddings(frame):
+    faces = detector.detect_faces(frame)
+    face_data_list = []
+
+    for face in faces:
+        x, y, w, h = face['box']
+        face_img = frame[y:y+h, x:x+w]
+        
+        # 얼굴을 160x160 크기로 변환
+        face_img = cv2.resize(face_img, (160, 160))
+        face_img = face_img.astype('float32') / 255.0
+        face_img = np.expand_dims(face_img, axis=0)
+        
+        # FaceNet 임베딩 추출
+        embedding = facenet_model.predict(face_img)
+        face_id = assign_face_id(face_tracker, embedding)  # ID 할당
+
+        face_data_list.append({
+            'box': [x, y, w, h],
+            'face_id': face_id
+        })
+    
+    return face_data_list
+
+# 임베딩을 비교하여 얼굴 ID 할당하는 함수
+def assign_face_id(face_tracker, new_embedding, threshold=0.5):
+    for face_id, tracked_face in face_tracker.items():
+        distance = np.linalg.norm(tracked_face['embedding'] - new_embedding)
+        if distance < threshold:  # 동일한 얼굴로 간주
+            return face_id
+    
+    # 새로운 얼굴인 경우 새로운 ID 할당
+    new_face_id = len(face_tracker)
+    face_tracker[new_face_id] = {'embedding': new_embedding}
+    return new_face_id
+
+# 썸네일 생성 함수 (각 얼굴 ID당 한 번만 생성)
+def generate_thumbnails(video_data):
+    cap = cv2.VideoCapture(io.BytesIO(video_data))
+    frame_id = 0
+    thumbnails = []
+    processed_face_ids = set()  # 이미 처리된 얼굴 ID를 저장
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # 얼굴 감지 및 임베딩 추출 (최초 감지 시)
+        face_data_list = detect_faces_and_get_embeddings(frame)
+        
+        for face_data in face_data_list:
+            face_id = face_data['face_id']
+            
+            # 얼굴 ID가 처음 감지되었을 때만 썸네일 생성
+            if face_id not in processed_face_ids:
+                x, y, w, h = face_data['box']
+                
+                # 얼굴 영역을 추출하여 썸네일 생성
+                face_thumbnail = frame[y:y+h, x:x+w]
+                _, buffer = cv2.imencode('.jpg', face_thumbnail)
+                
+                thumbnails.append({
+                    'frame_id': frame_id,
+                    'face_id': face_id,
+                    'thumbnail': buffer.tobytes()
+                })
+                
+                processed_face_ids.add(face_id)
+        
+        frame_id += 1
+    
+    cap.release()
+    return thumbnails
+
+# 얼굴 감지 결과를 캐싱하여 모자이크 처리
+def apply_mosaic(video_data, selected_face_ids, cached_face_data, extension, output_video_path, min_mosaic_size=10, max_mosaic_size=100):
+    cap = cv2.VideoCapture(io.BytesIO(video_data))
+    output_frames = []
+    frame_id = 0
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # 캐시된 얼굴 감지 데이터를 사용 (모델 사용 안 함)
+        face_data_list = cached_face_data.get(frame_id, [])
+        
+        for face_data in face_data_list:
+            face_id = face_data['face_id']
+            
+            # 선택된 얼굴 ID에 대해서만 모자이크 처리
+            if face_id in selected_face_ids:
+                x, y, w, h = face_data['box']
+                face_area = frame[y:y+h, x:x+w]
+                
+                # 얼굴이 화면에서 차지하는 비율 계산
+                face_area_ratio = (w * h) / (frame.shape[1] * frame.shape[0])
+                
+                # 모자이크 크기 설정
+                mosaic_size = int(min_mosaic_size + (max_mosaic_size - min_mosaic_size) * face_area_ratio)
+                mosaic_size = max(min_mosaic_size, min(mosaic_size, max_mosaic_size))  # 최소/최대 값으로 제한
+                
+                # 모자이크 처리
+                mosaic = cv2.resize(face_area, (mosaic_size, mosaic_size), interpolation=cv2.INTER_LINEAR)
+                mosaic = cv2.resize(mosaic, (w, h), interpolation=cv2.INTER_NEAREST)
+                
+                frame[y:y+h, x:x+w] = mosaic
+        
+        output_frames.append(frame)
+        frame_id += 1
+
+    cap.release()
+
+    # 비디오로 다시 인코딩, H.264 코덱 및 확장자 설정
+    temp_video_path = "temp_output.mp4"  # 임시 파일 저장 경로
+    fourcc = cv2.VideoWriter_fourcc(*'X264')
+    out = cv2.VideoWriter(temp_video_path, fourcc, 20.0, (frame.shape[1], frame.shape[0]))
+    
+    for frame in output_frames:
+        out.write(frame)
+
+    out.release()
+
+    # FFmpeg를 통해 AAC 오디오 코덱 추가 및 최종 비디오 생성
+    command = [
+        'ffmpeg', '-i', temp_video_path, '-c:v', 'libx264', '-c:a', 'aac', '-strict', '-2', output_video_path
+    ]
+    subprocess.run(command)
+
+    # 임시 파일 삭제
+    if os.path.exists(temp_video_path):
+        os.remove(temp_video_path)
+
+    return output_video_path
+
+@app.route('/generate_thumbnails', methods=['POST'])
+def generate_thumbnails_endpoint():
+    data = request.json
+    gcs_path = data.get('gcs_path')
+    video_data = download_video_from_gcs(gcs_path)
+    thumbnails = generate_thumbnails(video_data)
+    
+    # 썸네일을 Base64로 인코딩하여 클라이언트에 전송
+    thumbnails_encoded = []
+    for thumbnail in thumbnails:
+        thumbnail_base64 = base64.b64encode(thumbnail['thumbnail']).decode('utf-8')
+        thumbnails_encoded.append({
+            'frame_id': thumbnail['frame_id'],
+            'face_id': thumbnail['face_id'],
+            'thumbnail': thumbnail_base64  # Base64로 인코딩된 이미지 데이터
+        })
+    
+    return jsonify({'thumbnails': thumbnails_encoded})
+
+@app.route('/apply_mosaic', methods=['POST'])
+def apply_mosaic_endpoint():
+    data = request.json
+    gcs_path = data.get('gcs_path')
+    selected_face_ids = data.get('selected_face_ids', [])
+    extension = data.get('extension', 'mp4')  # 확장자를 받음, 기본값은 mp4
+    
+    video_data = download_video_from_gcs(gcs_path)
+    
+    # 먼저 얼굴 감지 및 캐싱
+    cap = cv2.VideoCapture(io.BytesIO(video_data))
+    frame_id = 0
+    cached_face_data = {}  # 프레임별 얼굴 감지 결과 저장
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # 얼굴 감지 및 임베딩 추출 (한 번만 수행)
+        face_data_list = detect_faces_and_get_embeddings(frame)
+        cached_face_data[frame_id] = face_data_list
+        
+        frame_id += 1
+
+    cap.release()
+
+    # 모자이크 처리
+    temp_output_path = f"output_with_audio.{extension}"
+    output_video_path = apply_mosaic(video_data, selected_face_ids, cached_face_data, extension, temp_output_path)
+
+    # 처리된 비디오를 GCS에 다시 업로드
+    blob = bucket.blob(f"processed/{gcs_path.split('/')[-1].split('.')[0]}.{extension}")
+    with open(output_video_path, 'rb') as f:
+        blob.upload_from_file(f, content_type=f'video/{extension}')
+    
+    # 임시 파일 삭제
+    if os.path.exists(output_video_path):
+        os.remove(output_video_path)
+
+    return jsonify({'processed_video_path': blob.public_url})
+
+if __name__ == '__main__':
+    app.run(debug=True)
