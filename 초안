@@ -137,6 +137,25 @@ def apply_mosaic(video_data, selected_face_ids, extension, output_video_path, mi
 
     return output_video_path
 
+@app.route('/generate_thumbnails', methods=['POST'])
+def generate_thumbnails_endpoint():
+    data = request.json
+    gcs_path = data.get('gcs_path')
+    video_data = download_video_from_gcs(gcs_path)
+    thumbnails = generate_thumbnails(video_data)
+    
+    # 썸네일을 Base64로 인코딩하여 클라이언트에 전송
+    thumbnails_encoded = []
+    for thumbnail in thumbnails:
+        thumbnail_base64 = base64.b64encode(thumbnail['thumbnail']).decode('utf-8')
+        thumbnails_encoded.append({
+            'frame_id': thumbnail['frame_id'],
+            'face_id': thumbnail['face_id'],
+            'thumbnail': thumbnail_base64  # Base64로 인코딩된 이미지 데이터
+        })
+    
+    return jsonify({'thumbnails': thumbnails_encoded})
+
 @app.route('/apply_mosaic', methods=['POST'])
 def apply_mosaic_endpoint():
     data = request.json
