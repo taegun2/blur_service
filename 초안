@@ -22,8 +22,14 @@ facenet_model = load_model('facenet_keras.h5')
 # 학습된 RetinaFace 모델 로드
 retinaface_model = RetinaFace.build_model('your_retinaface_model_path')
 
-# 얼굴 임베딩을 저장할 데이터 구조
-face_tracker = {}
+# 각 사용자의 캐시를 관리하기 위한 구조
+user_cache = {}
+
+# 사용자별 캐시 반환 함수
+def get_user_cache(user_id):
+    if user_id not in user_cache:
+        user_cache[user_id] = {}
+    return user_cache[user_id]
 
 # GCS에서 동영상 다운로드
 def download_video_from_gcs(gcs_path):
@@ -71,12 +77,15 @@ def assign_face_id(face_tracker, new_embedding, threshold=0.5):
     return new_face_id
 
 # 선택된 얼굴에 모자이크 처리 및 확장자에 따라 처리
-def apply_mosaic(video_data, selected_face_ids, extension, output_video_path, min_mosaic_size=10, max_mosaic_size=100):
+def apply_mosaic(video_data, selected_face_ids, extension, output_video_path, user_id, min_mosaic_size=10, max_mosaic_size=100):
     cap = cv2.VideoCapture(io.BytesIO(video_data))
     output_frames = []
     frame_id = 0
     temp_video_path = f"temp_output.{extension}"
     temp_audio_path = "temp_audio.aac"
+
+    # 사용자별 캐시 가져오기
+    face_tracker = get_user_cache(user_id)
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -84,7 +93,12 @@ def apply_mosaic(video_data, selected_face_ids, extension, output_video_path, mi
             break
         
         frame_height, frame_width = frame.shape[:2]
-        face_data_list = detect_faces_and_get_embeddings(frame)
+
+        # 캐시된 얼굴 데이터를 사용하여 중복 검출 방지
+        face_data_list = face_tracker.get(frame_id)
+        if not face_data_list:
+            face_data_list = detect_faces_and_get_embeddings(frame)
+            face_tracker[frame_id] = face_data_list
         
         for face_data in face_data_list:
             face_id = assign_face_id(face_tracker, face_data['embedding'])
@@ -137,12 +151,52 @@ def apply_mosaic(video_data, selected_face_ids, extension, output_video_path, mi
 
     return output_video_path
 
+# 썸네일 생성 함수 (각 얼굴 ID당 한 번만 생성)
+def generate_thumbnails(video_data, user_id):
+    cap = cv2.VideoCapture(io.BytesIO(video_data))
+    frame_id = 0
+    thumbnails = []
+    processed_face_ids = set()
+
+    # 사용자별 캐시 가져오기
+    face_tracker = get_user_cache(user_id)
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        face_data_list = face_tracker.get(frame_id)
+        if not face_data_list:
+            face_data_list = detect_faces_and_get_embeddings(frame)
+            face_tracker[frame_id] = face_data_list
+        
+        for face_data in face_data_list:
+            face_id = assign_face_id(face_tracker, face_data['embedding'])
+            if face_id not in processed_face_ids:
+                x, y, w, h = face_data['box']
+                face_thumbnail = frame[y:y+h, x:x+w]
+                _, buffer = cv2.imencode('.jpg', face_thumbnail)
+                
+                thumbnails.append({
+                    'frame_id': frame_id,
+                    'face_id': face_id,
+                    'thumbnail': buffer.tobytes()
+                })
+                processed_face_ids.add(face_id)
+        
+        frame_id += 1
+    
+    cap.release()
+    return thumbnails
+
 @app.route('/generate_thumbnails', methods=['POST'])
 def generate_thumbnails_endpoint():
     data = request.json
     gcs_path = data.get('gcs_path')
+    user_id = data.get('user_id')  # 사용자 ID를 요청에서 받음
     video_data = download_video_from_gcs(gcs_path)
-    thumbnails = generate_thumbnails(video_data)
+    thumbnails = generate_thumbnails(video_data, user_id)
     
     # 썸네일을 Base64로 인코딩하여 클라이언트에 전송
     thumbnails_encoded = []
@@ -151,7 +205,7 @@ def generate_thumbnails_endpoint():
         thumbnails_encoded.append({
             'frame_id': thumbnail['frame_id'],
             'face_id': thumbnail['face_id'],
-            'thumbnail': thumbnail_base64  # Base64로 인코딩된 이미지 데이터
+            'thumbnail': thumbnail_base64
         })
     
     return jsonify({'thumbnails': thumbnails_encoded})
@@ -160,13 +214,14 @@ def generate_thumbnails_endpoint():
 def apply_mosaic_endpoint():
     data = request.json
     gcs_path = data.get('gcs_path')
+    user_id = data.get('user_id')  # 사용자 ID를 요청에서 받음
     selected_face_ids = data.get('selected_face_ids', [])
     extension = data.get('extension', 'mp4')
 
     temp_output_path = f"output_with_audio.{extension}"
     
     video_data = download_video_from_gcs(gcs_path)
-    output_video_path = apply_mosaic(video_data, selected_face_ids, extension, temp_output_path)
+    output_video_path = apply_mosaic(video_data, selected_face_ids, extension, temp_output_path, user_id)
 
     blob = bucket.blob(f"processed/{gcs_path.split('/')[-1].split('.')[0]}.{extension}")
     with open(output_video_path, 'rb') as f:
