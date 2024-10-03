@@ -4,23 +4,41 @@ from flask import Flask, request, jsonify
 from google.cloud import storage
 import cv2
 import numpy as np
-from keras.models import load_model
-from retinaface import RetinaFace
+from tensorflow.keras.models import load_model  # TensorFlow 2.x 이상을 사용하는 경우
+import torch
+import torch.backends.cudnn as cudnn
+from models.retinaface import RetinaFace
+from utils.box_utils import decode, decode_landm
+from layers.functions.prior_box import PriorBox
+from utils.nms.py_cpu_nms import py_cpu_nms
 import io
 import base64
+from data import cfg_mnet, cfg_re50
+
+
 
 app = Flask(__name__)
 
 # Google Cloud Storage 설정
 client = storage.Client()
-bucket_name = 'your-gcs-bucket-name'
+bucket_name = 'video_uploaded'
 bucket = client.get_bucket(bucket_name)
 
 # FaceNet 모델 로드
 facenet_model = load_model('facenet_keras.h5')
 
 # 학습된 RetinaFace 모델 로드
-retinaface_model = RetinaFace.build_model('your_retinaface_model_path')
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+cfg = cfg_re50  # ResNet50 기반 설정
+retinaface_model = RetinaFace(cfg=cfg, phase='test')
+pretrained_path = 'your_retinaface_model_path'  # 학습된 모델 경로
+retinaface_model.load_state_dict(torch.load(pretrained_path, map_location=device))
+retinaface_model = retinaface_model.to(device)
+retinaface_model.eval()
+
+# GPU를 사용할 경우 cudnn 최적화 설정
+if torch.cuda.is_available():
+    cudnn.benchmark = True
 
 # 각 사용자의 캐시를 관리하기 위한 구조
 user_cache = {}
@@ -40,29 +58,69 @@ def download_video_from_gcs(gcs_path):
 # 오디오 추출 함수
 def extract_audio(video_path, audio_output_path):
     command = ['ffmpeg', '-i', video_path, '-q:a', '0', '-map', 'a', audio_output_path]
-    subprocess.run(command)
+    subprocess.run(command, check=True)
 
 # 얼굴 검출 및 임베딩 추출 함수 (RetinaFace + FaceNet)
 def detect_faces_and_get_embeddings(frame):
-    faces = RetinaFace.detect_faces(frame, model=retinaface_model, align=True)
+    # 이미지 전처리
+    img = np.float32(frame)
+    img -= (104, 117, 123)
+    img = img.transpose(2, 0, 1)
+    img = torch.from_numpy(img).unsqueeze(0)
+    img = img.to(device)
+
+    # 얼굴 검출
+    with torch.no_grad():
+        loc, conf, landms = retinaface_model(img)  # 추론
+
+    scale = torch.Tensor([frame.shape[1], frame.shape[0], frame.shape[1], frame.shape[0]])
+    scale = scale.to(device)
+    priorbox = PriorBox(cfg, image_size=(frame.shape[0], frame.shape[1]))
+    priors = priorbox.forward()
+    priors = priors.to(device)
+    prior_data = priors.data
+
+    boxes = decode(loc.data.squeeze(0), prior_data, cfg['variance'])
+    boxes = boxes * scale
+    boxes = boxes.cpu().numpy()
+    scores = conf.squeeze(0).data.cpu().numpy()[:, 1]
+    landms = decode_landm(landms.data.squeeze(0), prior_data, cfg['variance'])
+    landms = landms * scale.repeat(landms.size(1) // 2)
+    landms = landms.cpu().numpy()
+
+    # 신뢰도 필터링 및 NMS 적용
+    inds = np.where(scores > 0.5)[0]  # 신뢰도 임계값 적용
+    boxes = boxes[inds]
+    landms = landms[inds]
+    scores = scores[inds]
+
+    order = scores.argsort()[::-1]
+    boxes = boxes[order]
+    landms = landms[order]
+    scores = scores[order]
+
+    dets = np.hstack((boxes, scores[:, np.newaxis])).astype(np.float32, copy=False)
+    keep = py_cpu_nms(dets, 0.4)  # NMS 임계값
+    dets = dets[keep, :]
+    landms = landms[keep]
+
     face_embeddings = []
 
-    for face_id, face_data in faces.items():
-        x1, y1, x2, y2 = face_data['facial_area']
+    # FaceNet을 이용한 임베딩 추출
+    for i in range(dets.shape[0]):
+        x1, y1, x2, y2 = dets[i][:4].astype(int)
         face_img = frame[y1:y2, x1:x2]
-        landmarks = face_data['landmarks']
-
         face_img = cv2.resize(face_img, (160, 160))
         face_img = face_img.astype('float32') / 255.0
         face_img = np.expand_dims(face_img, axis=0)
 
         embedding = facenet_model.predict(face_img)
         face_embeddings.append({
-            'box': [x1, y1, x2-x1, y2-y1],
+            'box': [x1, y1, x2 - x1, y2 - y1],
             'embedding': embedding,
-            'landmarks': landmarks
+            'landmarks': landms[i].reshape((5, 2))  # 랜드마크 포함
         })
-    
+
     return face_embeddings
 
 # 임베딩을 비교하여 얼굴 ID 할당하는 함수
