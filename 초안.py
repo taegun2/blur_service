@@ -217,7 +217,7 @@ def generate_thumbnails(video_data, user_id):
     processed_face_ids = set()
 
     # 사용자별 캐시 가져오기
-    face_tracker = get_user_cache(user_id)
+    face_tracker = {}
 
     while cap.isOpened():
         ret, frame = cap.read()
