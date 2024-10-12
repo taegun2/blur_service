@@ -36,7 +36,7 @@ def load_model(model, pretrained_path, load_to_cpu):
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 load_to_cpu = not torch.cuda.is_available()
-cfg = cfg_mnet  # ResNet50 기반 설정
+cfg = cfg_mnet  # mobilenet0.25 기반 설정
 retinaface_model = RetinaFace(cfg=cfg, phase='test')
 
 # 사전 학습된 모델 로드
