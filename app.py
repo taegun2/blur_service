@@ -97,7 +97,7 @@ def download_video(gcs_path):
     video_data = blob.download_as_bytes()
     return video_data
 
-def detect_and_mosaic_face(frame, min_mosaic_size=30, max_mosaic_size=100):
+def detect_and_mosaic_face(frame, min_mosaic_size=10, max_mosaic_size=80):
     original_height, original_width = frame.shape[:2]
     target_size = 1600
     max_size = 2150
@@ -180,7 +180,7 @@ def detect_and_mosaic_face(frame, min_mosaic_size=30, max_mosaic_size=100):
         # 모자이크 적용
         face_region = frame[y1:y2, x1:x2]
         if face_region.size > 0:
-            face_region = cv2.resize(face_region, (mosaic_size, mosaic_size), interpolation=cv2.INTER_LINEAR)
+            face_region = cv2.resize(face_region, (mosaic_size, mosaic_size), interpolation=cv2.INTER_AREA)
             face_region = cv2.resize(face_region, (x2 - x1, y2 - y1), interpolation=cv2.INTER_NEAREST)
             frame[y1:y2, x1:x2] = face_region
 
