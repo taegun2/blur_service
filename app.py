@@ -1,4 +1,4 @@
-import tempfiled
+import tempfile
 from flask import Flask, request, jsonify
 from google.cloud import storage
 import cv2
